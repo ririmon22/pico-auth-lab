@@ -1,0 +1,14 @@
+# Build outputs
+build/
+**/build/
+
+# Local/generated metadata
+.codex/
+references/
+compile_commands.json
+
+# Hidden files/directories by default
+.*
+!.gitignore
+
+pico/AGENTS.md
