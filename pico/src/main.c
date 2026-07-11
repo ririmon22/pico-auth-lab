@@ -12,7 +12,6 @@ int main(void) {
   char buf[128];
 
   while (true) {
-    printf("> ");
     fflush(stdout);
 
     if (fgets(buf, sizeof(buf), stdin) != NULL) {

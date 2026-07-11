@@ -1,20 +1,13 @@
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
 
-int main(int argc, char *argv[]) {
+int main(void) {
   const char *device_path = "/dev/ttyACM0";
-  const char *message = "Hello";
-
-  if (argc > 1) {
-    device_path = argv[1];
-  }
-
-  if (argc > 2) {
-    message = argv[2];
-  }
+  char input[128];
 
   int fd = open(device_path, O_RDWR | O_NOCTTY);
   if (fd < 0) {
@@ -53,33 +46,41 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (write(fd, message, strlen(message)) < 0) {
-    perror("write");
-    close(fd);
-    return 1;
-  }
+  while (true) {
+    printf("pc> ");
+    fflush(stdout);
 
-  if (write(fd, "\n", 1) < 0) {
-    perror("write");
-    close(fd);
-    return 1;
-  }
+    if (fgets(input, sizeof(input), stdin) == NULL) {
+      break;
+    }
 
-  char response[64];
-  for (int i = 0; i < 5; i++) {
-    ssize_t count = read(fd, response, sizeof(response) - 1);
-    if (count < 0) {
-      perror("read");
+    if (strcmp(input, "quit\n") == 0 || strcmp(input, "exit\n") == 0) {
+      break;
+    }
+
+    if (write(fd, input, strlen(input)) < 0) {
+      perror("write");
       close(fd);
       return 1;
     }
 
-    if (count == 0) {
-      break;
-    }
+    char response[64];
+    for (int i = 0; i < 5; i++) {
+      ssize_t count = read(fd, response, sizeof(response) - 1);
+      if (count < 0) {
+        perror("read");
+        close(fd);
+        return 1;
+      }
 
-    response[count] = '\0';
-    printf("%s", response);
+      if (count == 0) {
+        break;
+      }
+
+      response[count] = '\0';
+      printf("%s", response);
+    }
+    printf("\n");
   }
 
   close(fd);
