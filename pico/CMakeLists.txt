@@ -12,11 +12,16 @@ pico_sdk_init()
 add_executable(pico_auth_lab
     src/main.c
     src/protocol.c
+    src/challenge.c
+    src/device_id.c
     src/hex.c
+    src/random.c
+    src/random_command.c
 )
 
 target_link_libraries(pico_auth_lab
     pico_stdlib
+    pico_rand
 )
 
 target_include_directories(pico_auth_lab
