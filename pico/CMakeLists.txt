@@ -11,10 +11,17 @@ pico_sdk_init()
 
 add_executable(pico_auth_lab
     src/main.c
+    src/protocol.c
+    src/hex.c
 )
 
 target_link_libraries(pico_auth_lab
     pico_stdlib
+)
+
+target_include_directories(pico_auth_lab
+    PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/include
 )
 
 target_compile_definitions(pico_auth_lab
