@@ -17,6 +17,8 @@ add_executable(pico_auth_lab
     src/hex.c
     src/random.c
     src/random_command.c
+    src/sha3.c
+    src/sha3_command.c
 )
 
 target_link_libraries(pico_auth_lab
