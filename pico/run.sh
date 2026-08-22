@@ -3,7 +3,8 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BUILD_DIR="${SCRIPT_DIR}/build"
-TARGET_UF2="${BUILD_DIR}/pico_auth_lab.uf2"
+BOOTLOADER_UF2="${BUILD_DIR}/bootloader.uf2"
+APP_UF2="${BUILD_DIR}/app.uf2"
 
 if [ -z "${PICO_SDK_PATH:-}" ]; then
   export PICO_SDK_PATH="/home/ririmon/pico/pico-sdk"
@@ -11,11 +12,25 @@ fi
 
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake --build "$BUILD_DIR"
-printf 'Built UF2: %s\n' "$TARGET_UF2"
+printf 'Built bootloader: %s\n' "$BOOTLOADER_UF2"
+printf 'Built application: %s\n' "$APP_UF2"
 
 if [ "${1:-}" = "build" ]; then
   exit 0
 fi
+
+case "${1:-bootloader}" in
+  bootloader)
+    TARGET_UF2="$BOOTLOADER_UF2"
+    ;;
+  app)
+    TARGET_UF2="$APP_UF2"
+    ;;
+  *)
+    printf 'Usage: %s [build|bootloader|app]\n' "$0" >&2
+    exit 2
+    ;;
+esac
 
 if ! command -v picotool >/dev/null 2>&1; then
   printf 'picotool not found.\n' >&2

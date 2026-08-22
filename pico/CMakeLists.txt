@@ -5,38 +5,47 @@ include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(pico_auth_lab C CXX ASM)
 
 set(CMAKE_C_STANDARD 99)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
 pico_sdk_init()
 
-add_executable(pico_auth_lab
-    src/main.c
-    src/protocol.c
-    src/challenge.c
-    src/device_id.c
-    src/hex.c
-    src/random.c
-    src/random_command.c
-    src/sha3.c
-    src/sha3_command.c
+add_executable(bootloader
+  bootloader/main.c
 )
 
-target_link_libraries(pico_auth_lab
-    pico_stdlib
-    pico_rand
+target_link_libraries(bootloader
+  pico_stdlib
 )
 
-target_include_directories(pico_auth_lab
-    PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}/include
+pico_enable_stdio_usb(bootloader 1)
+pico_enable_stdio_uart(bootloader 0)
+
+target_compile_definitions(bootloader
+  PRIVATE
+    static_assert=_Static_assert
 )
 
-target_compile_definitions(pico_auth_lab
-    PRIVATE
-        static_assert=_Static_assert
+pico_add_extra_outputs(bootloader)
+
+add_executable(app
+  app/main.c
 )
 
-pico_enable_stdio_usb(pico_auth_lab 1)
-pico_enable_stdio_uart(pico_auth_lab 0)
+target_link_libraries(app
+  pico_stdlib
+)
 
-pico_add_extra_outputs(pico_auth_lab)
+pico_enable_stdio_usb(app 1)
+pico_enable_stdio_uart(app 0)
+
+target_compile_definitions(app
+  PRIVATE
+    static_assert=_Static_assert
+)
+
+pico_add_linker_script_override_path(
+  app
+  ${CMAKE_CURRENT_LIST_DIR}/linker
+)
+
+pico_add_extra_outputs(app)
