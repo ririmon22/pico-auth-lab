@@ -1,0 +1,548 @@
+MKTME KeyID 1～5 / 5ページ化 修正手順
+===================================
+
+対象資料
+  code.pdf（code(1).pdf は同一内容）: Stage 1・Stage 2 の元実装
+  code2.pdf: AES-XTS-256 対応済み変更点
+
+前提
+  すでに Stage 1 と Stage 2、および code2.pdf の AES-XTS-256 変更が
+  作業ツリーに反映されている場合の追加変更を示す。
+  PDF はコードの抜粋であって現在のソースそのものではないため、
+  貼り付ける前に作業ツリーと照合すること。
+  各節の「探す場所」は元PDFの記述。PDFの自動改行をコードとして貼らない。
+
+試験の意味
+  slot[0] = page A / KeyID 1
+  slot[1] = page B / KeyID 2
+  slot[2] = page C / KeyID 3
+  slot[3] = page D / KeyID 4
+  slot[4] = page E / KeyID 5
+  全KeyIDのアルゴリズムは AES-XTS-256。5種類のアルゴリズムではない。
+  別々の物理ページとPTEのKeyIDを使い、各ページでwrite/readを行う。
+  各KeyIDに異なる鍵が生成されたことの暗号学的な証明ではない。
+  旧「同一PFNへKey1で書きKey2で読む」試験のAPIは今回置き換える。
+
+1. arch/x86/Kconfig
+-------------------
+探す場所: config X86_MKTME_ALIAS_TEST の help（code.pdf p.4）。
+依存条件や config 名はそのまま。help の Key1/Key2・1ページの説明を更新する。
+
+    config X86_MKTME_ALIAS_TEST
+        bool "MKTME KeyID experiment device"
+        depends on X86_64 && CPU_SUP_INTEL && EFI && !KASAN
+        default n
+        help
+          Provide /dev/mktme_test for a privileged, single-open experiment
+          with KeyIDs 1 through 5 and five separate payload pages.
+          Each slot owns one page and one KeyID. Requires exclusive use of
+          KeyIDs 1 through 5, one package, one memory node and
+          encryption-capable EFI RAM. Closing the device releases all pages.
+          This is an experimental validation interface, not an MKTME subsystem.
+
+2. include/uapi/linux/mktme_test.h
+----------------------------------
+探す場所: MKTME_TEST_MAX_BYTES / SET_READ_KEY / GET_INFO / FINISH（p.8）。
+既存ヘッダーの当該定義を次で置き換える。_IOW 番号 0xe0 を再利用するので、
+古い userspace バイナリと新しい kernel を混ぜないこと。
+
+    #define MKTME_TEST_MAX_BYTES 4096
+    #define MKTME_TEST_SLOTS 5
+
+    /* Last installed PTE for the currently selected slot, not a live query. */
+    struct mktme_test_info {
+        __u64 pfn;
+        __u64 pte;
+        __u32 keyid;
+        __u32 length;
+    };
+
+    /* slot 0..4 selects KeyID 1..5 and its dedicated page. */
+    #define MKTME_TEST_SELECT_SLOT _IOW('M', 0xe0, __u32)
+    #define MKTME_TEST_GET_INFO \
+        _IOR('M', 0xe1, struct mktme_test_info)
+    /* Release keys/pages now; close also performs cleanup. */
+    #define MKTME_TEST_FINISH _IO('M', 0xe2)
+
+注意: GET_INFO の pte/keyid はそのslotで最後に実際にmapした値。
+open直後は pfn のみ有効で、それ以外は初期値0。
+
+3. arch/x86/mm/mktme_test.c: session 構造体
+-------------------------------------------
+探す場所: test_page_encryptable() の次、struct test_session（p.18）。
+古い s->page, s->info, s->read_key を構造体から削除する。
+
+    struct test_slot {
+        struct page *page;
+        unsigned int keyid;
+        struct mktme_test_info info;
+    };
+
+    /* One session owns KeyIDs 1..5 and five payload pages. */
+    struct test_session {
+        struct test_config cfg;
+        struct mktme_key_program *prog;
+        struct test_slot slots[MKTME_TEST_SLOTS];
+        unsigned int attempted;
+        unsigned int selected_slot;
+    };
+
+直後の static DEFINE_MUTEX(test_lock); や active/poisoned/sleeping は維持。
+
+4. 同ファイル: test_configure()
+--------------------------------
+探す場所: cfg->nr = min_t(...) の直後（p.12～13）。
+code2.pdf p.2～3 の AES-XTS-256 capability / activation / policy の
+検査と診断ログは残す。KeyID数の条件だけ以下に変更。
+
+    cfg->nr = min_t(unsigned int, (1U << cfg->bits) - 1,
+                    (cfg->capability >> 36) & 0x7fff);
+    if (cfg->nr < MKTME_TEST_SLOTS ||
+        (physical_mask & cfg->mask) ||
+        (physical_mask & GENMASK_ULL(cfg->shift - 1, 0)) !=
+            GENMASK_ULL(cfg->shift - 1, 0))
+        return -EINVAL;
+
+cfg->bits の最低値を「5」に変えてはいけない。5つの非ゼロKeyIDには
+最低3bitが必要だが、この検査は cfg->nr >= 5 で実施する。
+
+5. 同ファイル: program_test_key()
+-----------------------------------
+探す場所: if (keyid != 1 && keyid != 2)（p.17、code2.pdf p.4）。
+code2.pdf の AES-XTS-256 版を基準とする。変更する判定は次だけ。
+
+    if (!keyid || keyid > MKTME_TEST_SLOTS)
+        return -EINVAL;
+
+次は必ず維持する（128へ戻さない）。
+
+    memset(prog, 0, sizeof(*prog));
+    prog->keyid = keyid;
+    prog->keyid_ctrl = MKTME_AES_XTS_256 |
+        (clear ? MKTME_KEYID_CLEAR_KEY : MKTME_KEYID_SET_KEY_RANDOM);
+    status = mktme_key_program(prog);
+
+6. 同ファイル: test_close_session()【関数全体】
+---------------------------------------------
+探す場所: test_on_cpu() の後（p.19～20）。
+既存の関数全体を置換。open途中の失敗時にも NULL page/prog を扱える。
+cleanupに失敗したら poisoned を維持し、再利用を禁止する。
+
+    static long test_close_session(void *arg)
+    {
+        struct test_session *s = arg;
+        unsigned int i, keyid;
+        int ret = 0;
+
+        /* No temporary alias survives a read/write, including errors. */
+        for (i = 0; i < MKTME_TEST_SLOTS; i++) {
+            struct page *page = s->slots[i].page;
+
+            if (!page)
+                continue;
+            clear_page(page_address(page));
+            clflush_cache_range(page_address(page), PAGE_SIZE);
+        }
+        if (s->attempted) {
+            test_check_cpu(&s->cfg);
+            if (s->cfg.bad) {
+                ret = -EIO;
+            } else {
+                for (keyid = 1; keyid <= s->attempted; keyid++)
+                    if (program_test_key(s->prog, keyid, true))
+                        ret = -EIO;
+            }
+        }
+        if (ret) {
+            poisoned = true;
+            pr_err("key cleanup failed; device disabled until reboot\n");
+        }
+        for (i = 0; i < MKTME_TEST_SLOTS; i++) {
+            if (s->slots[i].page)
+                __free_page(s->slots[i].page);
+            s->slots[i].page = NULL;
+            memset(&s->slots[i].info, 0, sizeof(s->slots[i].info));
+            s->slots[i].keyid = 0;
+        }
+        if (s->prog) {
+            memzero_explicit(s->prog, PAGE_SIZE);
+            free_page((unsigned long)s->prog);
+        }
+        s->prog = NULL;
+        s->attempted = 0;
+        s->selected_slot = 0;
+        return ret;
+    }
+
+注: このcleanupは元コードの Key0 経由ゼロ化・flush の方針を5ページに
+広げたもの。PCONFIGの失敗時には再試行せず元コード同様にpoisonする。
+
+7. 同ファイル: test_open_session()【関数全体】
+--------------------------------------------
+探す場所: test_close_session() の後、struct test_io の前（p.21～22）。
+code2.pdf の EFI 属性エラーログも slot 毎に残す。
+
+    static long test_open_session(void *arg)
+    {
+        struct test_session *s = arg;
+        unsigned int i, keyid;
+        int ret;
+
+        ret = test_configure(&s->cfg);
+        if (ret)
+            return ret;
+        /* Page allocation also satisfies PCONFIG's 256-byte alignment. */
+        BUILD_BUG_ON(sizeof(*s->prog) > PAGE_SIZE);
+        BUILD_BUG_ON(offsetof(struct mktme_key_program, keyid_ctrl) != 2);
+        BUILD_BUG_ON(offsetof(struct mktme_key_program, key_field_1) != 64);
+        BUILD_BUG_ON(MKTME_TEST_MAX_BYTES != PAGE_SIZE);
+        s->prog = (void *)get_zeroed_page(GFP_KERNEL);
+        if (!s->prog)
+            return -ENOMEM;
+
+        for (i = 0; i < MKTME_TEST_SLOTS; i++) {
+            struct test_slot *slot = &s->slots[i];
+
+            slot->page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+            if (!slot->page) {
+                ret = -ENOMEM;
+                goto fail;
+            }
+            if (!test_page_encryptable(slot->page)) {
+                pr_err("slot=%u payload PFN=%#lx lacks EFI CPU_CRYPTO+WB coverage (saved_ranges=%u)\n",
+                       i, page_to_pfn(slot->page), nr_crypto_ranges);
+                ret = -EOPNOTSUPP;
+                goto fail;
+            }
+            slot->keyid = i + 1;
+            slot->info.pfn = page_to_pfn(slot->page);
+        }
+        for (keyid = 1; keyid <= MKTME_TEST_SLOTS; keyid++) {
+            /* Include the failed attempt in cleanup, as in the original. */
+            s->attempted = keyid;
+            ret = program_test_key(s->prog, keyid, false);
+            if (ret)
+                goto fail;
+        }
+        for (i = 0; i < MKTME_TEST_SLOTS; i++)
+            clflush_cache_range(page_address(s->slots[i].page), PAGE_SIZE);
+        s->selected_slot = 0;
+        return 0;
+    fail:
+        test_close_session(s);
+        return ret;
+    }
+
+8. 同ファイル: test_access()【関数全体】
+-------------------------------------
+探す場所: struct test_io の後、test_open() の前（p.23）。
+書込みも読込みも selected_slot の同一KeyIDを使う。
+
+    static long test_access(void *arg)
+    {
+        struct test_io *io = arg;
+        struct test_session *s = io->session;
+        struct test_alias alias = { };
+        struct test_slot *slot;
+        int ret;
+
+        if (s->selected_slot >= MKTME_TEST_SLOTS)
+            return -EINVAL;
+        slot = &s->slots[s->selected_slot];
+        if (!slot->page)
+            return -ENODEV;
+
+        /* Recheck execution CPU after hotplug between syscalls. */
+        test_check_cpu(&s->cfg);
+        if (s->cfg.bad || !intel_mktme_test_enabled())
+            return -EOPNOTSUPP;
+        ret = mktme_test_map_pfn(&s->cfg, page_to_pfn(slot->page),
+                                 slot->keyid, &alias);
+        if (ret)
+            return ret;
+        if (io->writing) {
+            memset(alias.area->addr, 0, PAGE_SIZE);
+            memcpy(alias.area->addr, io->buffer, io->length);
+            slot->info.length = io->length;
+        } else {
+            memcpy(io->buffer, alias.area->addr, io->length);
+        }
+        slot->info.keyid = slot->keyid;
+        slot->info.pfn = page_to_pfn(slot->page);
+        slot->info.pte = pte_val(alias.pte);
+        mktme_test_unmap(&alias);
+        return 0;
+    }
+
+元の mktme_test_make_pte(), mktme_test_map_pfn(), mktme_test_unmap() は維持。
+PTEとPFNが期待どおりかの検査もそれらの既存処理に従う。
+
+9. 同ファイル: test_transfer()【関数全体】
+---------------------------------------
+探す場所: test_open/test_release の後（p.26～27）。
+選択slotごとのlengthを使う。元コードの転送上限・mutex・copy位置は維持。
+
+    static ssize_t test_transfer(struct file *file, void __user *user,
+                                 size_t count, bool writing)
+    {
+        struct test_session *s = file->private_data;
+        struct test_io io = { .session = s, .writing = writing };
+        struct test_slot *slot;
+        ssize_t ret;
+
+        if (count > MKTME_TEST_MAX_BYTES)
+            return -EMSGSIZE;
+        if (!count)
+            return 0;
+        if (mutex_lock_interruptible(&test_lock))
+            return -ERESTARTSYS;
+        ret = -EINVAL;
+        if (s->selected_slot >= MKTME_TEST_SLOTS)
+            goto out;
+        slot = &s->slots[s->selected_slot];
+        ret = -ENODEV;
+        if (!slot->page)
+            goto out;
+        ret = -ENODATA;
+        if (!writing && !slot->info.length)
+            goto out;
+        io.length = writing ? count : min_t(size_t, count, slot->info.length);
+        ret = -ENOMEM;
+        io.buffer = kmalloc(io.length, GFP_KERNEL);
+        if (!io.buffer)
+            goto out;
+        ret = -EFAULT;
+        /* User copies run in the caller's mm, not in work_on_cpu(). */
+        if (writing && copy_from_user(io.buffer, user, io.length))
+            goto free_buffer;
+        ret = test_on_cpu(test_access, &io);
+        if (ret)
+            goto free_buffer;
+        if (!writing && copy_to_user(user, io.buffer, io.length)) {
+            ret = -EFAULT;
+            goto free_buffer;
+        }
+        ret = io.length;
+    free_buffer:
+        kfree(io.buffer);
+    out:
+        mutex_unlock(&test_lock);
+        return ret;
+    }
+
+10. 同ファイル: test_ioctl()【関数全体】
+------------------------------------
+探す場所: test_write の後（p.28～29）。
+SELECT_SLOTが選ぶのは「読み鍵」ではなく「ページ+鍵の組」。
+GET_INFOは選択中slotの記録を返す。FINISHの処理は維持。
+
+    static long test_ioctl(struct file *file, unsigned int cmd,
+                           unsigned long arg)
+    {
+        struct test_session *s = file->private_data;
+        void __user *user = (void __user *)arg;
+        __u32 slot_index;
+        long ret = 0;
+
+        if (mutex_lock_interruptible(&test_lock))
+            return -ERESTARTSYS;
+        if (!s->slots[0].page) {
+            ret = -ENODEV;
+            goto out;
+        }
+        switch (cmd) {
+        case MKTME_TEST_SELECT_SLOT:
+            if (copy_from_user(&slot_index, user, sizeof(slot_index)))
+                ret = -EFAULT;
+            else if (slot_index >= MKTME_TEST_SLOTS)
+                ret = -EINVAL;
+            else
+                s->selected_slot = slot_index;
+            break;
+        case MKTME_TEST_GET_INFO:
+            if (s->selected_slot >= MKTME_TEST_SLOTS) {
+                ret = -EINVAL;
+                break;
+            }
+            if (copy_to_user(user, &s->slots[s->selected_slot].info,
+                             sizeof(struct mktme_test_info)))
+                ret = -EFAULT;
+            break;
+        case MKTME_TEST_FINISH:
+            ret = test_on_cpu(test_close_session, s);
+            break;
+        default:
+            ret = -ENOTTY;
+        }
+    out:
+        mutex_unlock(&test_lock);
+        return ret;
+    }
+
+11. tools/mktme_test/mktme_test_user.c【ファイル全体】
+------------------------------------------------
+元の read_key(), get_info(), main() は同一PFN alias を期待するため削除。
+次は置換できる完全な userspace 例。5slotすべてに書いた後、全slotを
+読み直し、PFN一意性・KeyID・長さ・データ一致を確認する。
+PTEの生のKeyID bit位置はCPU依存なので、この例はPTE値の表示に留める。
+KeyID/PFNをPTEから検査する処理はkernel側の既存 make_pte() に依存。
+
+    // SPDX-License-Identifier: GPL-2.0
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <inttypes.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <sys/ioctl.h>
+    #include <unistd.h>
+    #include "../../include/uapi/linux/mktme_test.h"
+
+    static int command(int fd, unsigned long op, void *arg)
+    {
+        int ret;
+
+        do {
+            ret = ioctl(fd, op, arg);
+        } while (ret < 0 && errno == EINTR);
+        return ret;
+    }
+
+    static ssize_t write_retry(int fd, const void *buf, size_t length)
+    {
+        ssize_t n;
+
+        do {
+            n = write(fd, buf, length);
+        } while (n < 0 && errno == EINTR);
+        return n;
+    }
+
+    static ssize_t read_retry(int fd, void *buf, size_t length)
+    {
+        ssize_t n;
+
+        do {
+            n = read(fd, buf, length);
+        } while (n < 0 && errno == EINTR);
+        return n;
+    }
+
+    int main(void)
+    {
+        static const char *const pattern[MKTME_TEST_SLOTS] = {
+            "MKTME KEY 1 TEST DATA", "MKTME KEY 2 TEST DATA",
+            "MKTME KEY 3 TEST DATA", "MKTME KEY 4 TEST DATA",
+            "MKTME KEY 5 TEST DATA"
+        };
+        struct mktme_test_info info;
+        unsigned char buffer[MKTME_TEST_MAX_BYTES];
+        uint64_t pfns[MKTME_TEST_SLOTS] = { 0 };
+        unsigned int i, j;
+        size_t length;
+        ssize_t n;
+        int fd, result = EXIT_FAILURE;
+
+        fd = open("/dev/mktme_test", O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            perror("open /dev/mktme_test");
+            return EXIT_FAILURE;
+        }
+        for (i = 0; i < MKTME_TEST_SLOTS; i++) {
+            __u32 selected = i;
+
+            if (command(fd, MKTME_TEST_SELECT_SLOT, &selected) < 0) {
+                perror("SELECT_SLOT (write)");
+                goto finish;
+            }
+            length = strlen(pattern[i]) + 1;
+            n = write_retry(fd, pattern[i], length);
+            if (n < 0) {
+                perror("write");
+                goto finish;
+            }
+            if ((size_t)n != length) {
+                fprintf(stderr, "slot %u: short write: %zd/%zu\n",
+                        i, n, length);
+                goto finish;
+            }
+        }
+        for (i = 0; i < MKTME_TEST_SLOTS; i++) {
+            __u32 selected = i;
+
+            if (command(fd, MKTME_TEST_SELECT_SLOT, &selected) < 0) {
+                perror("SELECT_SLOT (read)");
+                goto finish;
+            }
+            length = strlen(pattern[i]) + 1;
+            memset(buffer, 0, sizeof(buffer));
+            n = read_retry(fd, buffer, length);
+            if (n < 0) {
+                perror("read");
+                goto finish;
+            }
+            if ((size_t)n != length ||
+                memcmp(pattern[i], buffer, length)) {
+                fprintf(stderr, "slot %u: read mismatch (%zd/%zu)\n",
+                        i, n, length);
+                goto finish;
+            }
+            if (command(fd, MKTME_TEST_GET_INFO, &info) < 0) {
+                perror("GET_INFO");
+                goto finish;
+            }
+            if (info.keyid != i + 1 || info.length != length ||
+                !info.pte) {
+                fprintf(stderr, "slot %u: unexpected info\n", i);
+                goto finish;
+            }
+            for (j = 0; j < i; j++) {
+                if (info.pfn == pfns[j]) {
+                    fprintf(stderr, "slot %u: duplicate PFN\n", i);
+                    goto finish;
+                }
+            }
+            pfns[i] = info.pfn;
+            printf("slot=%u PFN=0x%" PRIx64 " PTE=0x%" PRIx64
+                   " KeyID=%u length=%u PASS\n",
+                   i, (uint64_t)info.pfn, (uint64_t)info.pte,
+                   info.keyid, info.length);
+        }
+        result = EXIT_SUCCESS;
+    finish:
+        if (command(fd, MKTME_TEST_FINISH, NULL) < 0) {
+            perror("FINISH");
+            result = EXIT_FAILURE;
+        }
+        if (close(fd) < 0) {
+            perror("close");
+            result = EXIT_FAILURE;
+        }
+        return result;
+    }
+
+tools/mktme_test/Makefile は元のままでよい。旧コマンドライン引数 [text]
+はなくなるので、起動は tools/mktme_test/mktme_test_user とする。
+
+12. 照合・検証
+--------------
+  A. まず code2.pdf の MKTME_AES_XTS_256 定義、detect_tme()、
+     test_configure()、program_test_key() の変更が実ソースにあることを確認。
+     code.pdf はAES-XTS-128の古い状態を載せている。
+  B. arch/x86/mm/mktme_test.c / UAPI / userspace に残る s->page、
+     s->info、s->read_key、SET_READ_KEY、KeyID 1/2 固定条件を検索。
+     他の文脈もあるので一律置換しない。
+  C. 元kernelのconfigでビルドし、userspaceは
+     make -C tools/mktme_test で警告なくビルドされることを確認。
+  D. 実機実行は元コードの前提（単一package/node、対象CPU、EFI属性、
+     KeyID 1～5の占有等）を確認した環境で行う。出力5行のPASS、
+     異なる5 PFN、KeyID 1～5、各slotのread一致、FINISH成功を確認。
+  E. 今回の正常系だけでは異なるKeyIDによる同一PFNの別名参照や
+     鍵の独立性の強い実証にはならない。alias試験は別途設計する。
+
+元コードから維持する箇所
+  arch/x86/Kconfig.cpu、pgtable_types.h のPFN分離、intel.cの
+  physical_maskとAES-XTS-256の判定、intel_pconfig.h、EFI map保存、
+  Makefile、mktme_test_make_pte/map_pfn/unmap、test_check_cpu、
+  test_on_cpu、test_open/release/read/write、compat_ioctl、PM notifier。
+  元の組込み経路と排他・CPU pinningを維持する。
